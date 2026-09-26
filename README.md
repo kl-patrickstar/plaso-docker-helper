@@ -41,7 +41,7 @@ docker pull log2timeline/plaso
 
 ```powershell
 # Repository klonen
-git clone https://github.com/<DEIN-USERNAME>/plaso-docker-helper.git
+git clone https://github.com/kl-patrickstar/plaso-docker-helper.git
 cd plaso-docker-helper
 
 # Virtuelle Umgebung erstellen (optional, aber empfohlen)
