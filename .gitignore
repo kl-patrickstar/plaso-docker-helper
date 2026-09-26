@@ -31,3 +31,5 @@ desktop.ini
 build/
 dist/
 *.spec
+# Lokale Backups
+*.backup-*
