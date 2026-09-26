@@ -26,3 +26,8 @@ desktop.ini
 *.plaso
 *.csv
 *.log
+
+# PyInstaller
+build/
+dist/
+*.spec
