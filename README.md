@@ -53,7 +53,7 @@ Voraussetzungen: Docker Desktop läuft, Plaso-Image ist gepullt.
 
 ```powershell
 # Repository klonen
-git clone https://github.com/<USERNAME>/<REPO-NAME>.git
+git clone https://github.com/kl-patrickstar/plaso-docker-helper.git
 cd plaso-docker-helper
 
 # Virtuelle Umgebung erstellen (optional, aber empfohlen)
