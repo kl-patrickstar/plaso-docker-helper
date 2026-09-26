@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-plaso_gui.py - Plaso DFIR Helper (Final Edition + Quell-Modus "Vorhandene .plaso")
+plaso_gui.py - Plaso DFIR Helper (Quell-Modus "Vorhandene .plaso")
 
-Architektur:
-    GUI (Tkinter)
-       │
-       ▼
-    Preflight (Validierung VOR dem Start)
-       │
-       ▼
-    PlasoCommandBuilder → baut log2timeline / pinfo / psort Kommandos
-       │
-       ▼
-    DockerRunner         → Prozessausführung, Streaming, Exit-Codes
-       │
-       ▼
-    Plaso                → log2timeline → pinfo → psort
-                           ODER (.plaso-Modus) → pinfo → psort
+Quell-Modi:
+  * Einzel-Image                      → 7 Schritte
+  * Ordner (KAPE/Triage)              → 5 Schritte (ohne BitLocker/Partition)
+  * Batch                             → 7 Schritte
+  * Vorhandene .plaso-Datei           → 3 Schritte
 
-Neu:
-  * Schritt 1 hat VIER Quell-Modi:
-      - Einzel-Image
-      - Ordner (Triage/KAPE)
-      - Batch (mehrere Quellen)
-      - Vorhandene .plaso-Datei  ← log2timeline wird übersprungen
-  * Im .plaso-Modus werden Zielordner, Basisname und Exportformat
-    direkt in Schritt 1 gewählt.
-  * Der Workflow springt dann von Schritt 1 direkt zu Optionen → Ausführen.
-  * Die Step-Leiste passt sich dem Modus dynamisch an.
+Struktur (Image/Batch):
+  Quelle → Ausgabe (Ziel + .plaso-Name) → BitLocker → Partition
+        → Parser → Optionen (Export-Name + Format + Filter/Zeitraum)
+        → Ausführen (Zusammenfassung + Start)
+
+Struktur (Ordner):
+  Quelle → Ausgabe (Ziel + .plaso-Name) → Parser
+        → Optionen (Export-Name + Format + Filter/Zeitraum)
+        → Ausführen (Zusammenfassung + Start)
+
+Struktur (.plaso):
+  Quelle (.plaso wählen) → Optionen (Ziel + Export-Name + Format
+        + Filter/Zeitraum) → Ausführen (Zusammenfassung + Start)
+
+Der Inhaltsbereich ist vertikal scrollbar (Mausrad + Scrollbar).
 """
 
 import os
@@ -49,9 +44,7 @@ from tkinter import ttk, filedialog, messagebox
 # ══════════════════════════════════════════════════════════════════════════
 
 PLASO_DOCKER_IMAGE = "log2timeline/plaso:20260720"
-
 PLASO_DOCKER_DIGEST = "sha256:a8d42e64dcd3af2dffed8ddb25d34f34def69b672eec97ea9af62885c9332950"
-
 OUTPUT_TIMEZONE = None
 
 OUTPUT_FORMATS = [
@@ -65,52 +58,40 @@ OUTPUT_FORMATS = [
 
 PSORT_FILTER_PRESETS = [
     ("Alles (kein Filter)", ""),
-
     ("Benutzeraktivität",
-     "data_type contains 'userassist' or "
-     "data_type contains 'bagmru' or "
-     "data_type contains 'typedurls' or "
-     "data_type contains 'shell_item'"),
-
+     "data_type contains 'windows:registry:userassist' or "
+     "data_type contains 'windows:registry:bagmru' or "
+     "data_type contains 'windows:registry:typedurls' or "
+     "data_type contains 'windows:shell_item'"),
     ("Programmausführung",
      "data_type contains 'prefetch' or "
-     "data_type contains 'amcache' or "
-     "data_type contains 'appcompatcache' or "
+     "data_type contains 'windows:registry:amcache' or "
+     "data_type contains 'windows:registry:appcompatcache' or "
      "data_type contains 'windows:registry:bam' or "
-     "data_type contains 'userassist'"),
-
+     "data_type contains 'windows:registry:userassist'"),
     ("Persistenz (Autostart)",
      "data_type contains 'windows:registry:run' or "
      "data_type contains 'windows:registry:service' or "
-     "data_type contains 'windows:task_scheduler' or "
-     "data_type contains 'boot_execute' or "
-     "data_type contains 'winlogon'"),
-
+     "data_type contains 'windows:registry:task_scheduler:task_cache:entry' or "
+     "data_type contains 'windows:registry:boot_execute' or "
+     "data_type contains 'windows:registry:winlogon'"),
     ("USB / externe Geräte",
      "data_type contains 'usb' or "
-     "data_type contains 'mount_points' or "
-     "data_type contains 'mountpoints'"),
-
+     "data_type contains 'windows:registry:mount_points' or "
+     "data_type contains 'windows:registry:network'"),
     ("Browser-Aktivität",
-     "data_type contains 'chrome' or "
-     "data_type contains 'firefox' or "
-     "data_type contains 'msie' or "
-     "data_type contains 'edge' or "
-     "data_type contains 'opera' or "
-     "data_type contains 'safari'"),
-
+     "data_type contains 'chrome' or data_type contains 'firefox' or "
+     "data_type contains 'msie' or data_type contains 'edge' or "
+     "data_type contains 'opera' or data_type contains 'safari'"),
     ("An-/Abmeldungen & Shutdown",
-     "data_type contains 'shutdown' or "
-     "data_type contains 'startup' or "
-     "data_type contains 'timezone' or "
-     "data_type contains 'logon' or "
-     "data_type contains 'logoff'"),
-
+     "data_type contains 'windows:registry:shutdown' or "
+     "data_type contains 'windows:registry:boot_execute' or "
+     "(data_type is 'windows:evtx:record' and source_name is 'Security' and "
+     "(event_identifier is 4624 or event_identifier is 4634))"),
     ("Eigener Filter …", "__CUSTOM__"),
 ]
 
 CUSTOM_FILTER_SENTINEL = "__CUSTOM__"
-
 PHYSICAL_ONLY_PARSERS = set()
 
 
@@ -119,14 +100,6 @@ PHYSICAL_ONLY_PARSERS = set()
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_catalog():
-    """
-    Parser-Katalog.
-    Format pro Parser: (name, beschreibung, quelle, plugins)
-    quelle:
-      "both"                            → ✅ Image + Triage-Ordner
-      "triage"                          → 📁 Nur Triage-Ordner
-      ("image", "<spezifische Rohdatei>") → 💾 Image oder Ordner mit <Datei>
-    """
     return {
         "recommended": ("⭐ Empfohlen für Windows-Triage", [
             ("winreg",       "Windows Registry – wichtigste Quelle für Benutzeraktivität", "both", []),
@@ -328,7 +301,7 @@ COLOR_SUCCESS   = "#1F8B4C"
 def format_docker_path(path_str) -> str:
     if not path_str:
         return ""
-    raw = str(path_str)          # ← akzeptiert auch Path / WindowsPath
+    raw = str(path_str)
     try:
         p = Path(raw.strip().strip('"').strip("'")).resolve()
         return str(p).replace("\\", "/")
@@ -342,6 +315,18 @@ def sha256_of_file(path, chunk_size=1 << 20):
         for block in iter(lambda: f.read(chunk_size), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def strip_known_extensions(name: str) -> str:
+    """Entfernt .plaso und alle Output-Erweiterungen vom Nutzerinput."""
+    name = name.strip()
+    if name.lower().endswith(".plaso"):
+        name = name[:-len(".plaso")]
+    for _, _, ext, _ in OUTPUT_FORMATS:
+        if name.lower().endswith(ext):
+            name = name[:-len(ext)]
+            break
+    return name
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -369,8 +354,7 @@ class DockerRunner:
             self.process.wait()
             return self.process.returncode
         except FileNotFoundError:
-            self.log_queue.put("✘ FEHLER: 'docker' wurde nicht gefunden. "
-                               "Läuft Docker Desktop?\n")
+            self.log_queue.put("✘ FEHLER: 'docker' wurde nicht gefunden.\n")
             return -1
         except PermissionError as e:
             self.log_queue.put(f"✘ FEHLER (Permission): {e}\n")
@@ -438,7 +422,7 @@ class PlasoCommandBuilder:
     def build_pinfo_on_file(self, plaso_path: str) -> list:
         p = Path(plaso_path).resolve()
         return ["docker", "run", "--rm",
-                "-v", f"{format_docker_path(str(p.parent))}:/mnt/input:ro",   # ← mit str()
+                "-v", f"{format_docker_path(str(p.parent))}:/mnt/input:ro",
                 self.docker_image, "pinfo",
                 f"/mnt/input/{p.name}"]
 
@@ -447,7 +431,8 @@ class PlasoCommandBuilder:
         host_out = format_docker_path(out_dir)
         cmd = ["docker", "run", "--rm",
                "-v", f"{host_out}:/mnt/output",
-               self.docker_image, "psort", "-o", fmt]
+               self.docker_image, "psort", "-o", fmt,
+               "--status_view", "none"]
         if self.timezone:
             cmd += ["--output-time-zone", self.timezone]
         cmd += ["-w", f"/mnt/output/{output_filename}",
@@ -460,12 +445,13 @@ class PlasoCommandBuilder:
                                   output_filename, fmt,
                                   filter_expression=None):
         p = Path(plaso_path).resolve()
-        host_src = format_docker_path(str(p.parent))  # ← mit str()
+        host_src = format_docker_path(str(p.parent))
         host_out = format_docker_path(out_dir)
         cmd = ["docker", "run", "--rm",
                "-v", f"{host_src}:/mnt/input:ro",
                "-v", f"{host_out}:/mnt/output",
-               self.docker_image, "psort", "-o", fmt]
+               self.docker_image, "psort", "-o", fmt,
+               "--status_view", "none"]
         if self.timezone:
             cmd += ["--output-time-zone", self.timezone]
         cmd += ["-w", f"/mnt/output/{output_filename}",
@@ -484,8 +470,8 @@ class PlasoWizard:
     def __init__(self, root):
         self.root = root
         root.title("Plaso DFIR Helper")
-        root.geometry("1220x880")
-        root.minsize(1020, 740)
+        root.geometry("1220x900")
+        root.minsize(1020, 760)
         root.configure(bg=COLOR_BG)
 
         self.catalog = build_catalog()
@@ -500,24 +486,20 @@ class PlasoWizard:
         self.current_step = 0
 
         self.state = {
-            # NEU: vierter Modus "plaso"
-            "input_mode": "single",       # single | folder | batch | plaso
+            "input_mode": "single",     # single | folder | batch | plaso
             "input_path": None,
             "input_dir": None,
             "input_file": None,
             "batch_items": [],
-            # .plaso-Modus
             "existing_plaso_path": None,
-            # Ausgabe
             "out_dir": None,
-            "name": None,
+            "name": None,               # .plaso-Basisname
+            "name_export": None,        # psort-Export-Basisname
             "selected_formats": [("json_line", ".jsonl")],
-            # log2timeline-Optionen (nur Image-Modi)
             "credential_arg": [],
             "partitions_arg": [],
             "vss_arg": [],
             "selected_parsers": set(),
-            # Optionen (beide Modi)
             "time_filter_enabled": False,
             "time_from": None,
             "time_to": None,
@@ -525,7 +507,7 @@ class PlasoWizard:
             "filter_custom": "",
         }
 
-        self.steps = self._get_steps()      # ← NEU hier
+        self.steps = self._get_steps()
 
         self.log_queue = queue.Queue()
         self.runner = DockerRunner(self.log_queue)
@@ -573,7 +555,7 @@ class PlasoWizard:
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
     # ─────────────────────────────────────────────────────────
-    #  Layout
+    #  Layout  (mit scrollbarem Inhaltsbereich)
     # ─────────────────────────────────────────────────────────
 
     def _build_layout(self):
@@ -588,9 +570,30 @@ class PlasoWizard:
         self.step_bar.pack(fill="x")
         self.step_bar.pack_propagate(False)
 
-        self.content = tk.Frame(self.root, bg=COLOR_BG)
-        self.content.pack(fill="both", expand=True, padx=22, pady=(15, 5))
+        # ── Scrollbarer Inhaltsbereich ─────────────────────────
+        content_outer = tk.Frame(self.root, bg=COLOR_BG)
+        content_outer.pack(fill="both", expand=True, padx=22, pady=(15, 5))
 
+        self.content_canvas = tk.Canvas(content_outer, bg=COLOR_BG,
+                                        highlightthickness=0, bd=0)
+        content_vsb = ttk.Scrollbar(content_outer, orient="vertical",
+                                    command=self.content_canvas.yview)
+        self.content_canvas.configure(yscrollcommand=content_vsb.set)
+
+        content_vsb.pack(side="right", fill="y")
+        self.content_canvas.pack(side="left", fill="both", expand=True)
+
+        self.content = tk.Frame(self.content_canvas, bg=COLOR_BG)
+        self.content_window = self.content_canvas.create_window(
+            (0, 0), window=self.content, anchor="nw")
+
+        self.content.bind("<Configure>", self._on_content_configure)
+        self.content_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.content_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.content_canvas.bind_all("<Button-4>",   self._on_mousewheel)
+        self.content_canvas.bind_all("<Button-5>",   self._on_mousewheel)
+
+        # ── Footer ─────────────────────────────────────────────
         footer = tk.Frame(self.root, bg="#e2e2e2", height=70)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
@@ -611,12 +614,64 @@ class PlasoWizard:
         self._rebuild_step_bar()
 
     # ─────────────────────────────────────────────────────────
-    #  Step-Leiste (dynamisch je Modus)
+    #  Scroll-Helfer
+    # ─────────────────────────────────────────────────────────
+
+    def _on_content_configure(self, event=None):
+        self.content_canvas.configure(
+            scrollregion=self.content_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # Inneren Frame auf volle Canvas-Breite dehnen
+        self.content_canvas.itemconfig(self.content_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # Nur scrollen, wenn Maus über dem Content-Bereich ist
+        try:
+            widget_under = self.root.winfo_containing(event.x_root,
+                                                      event.y_root)
+        except Exception:
+            widget_under = None
+        if widget_under is None:
+            return
+
+        # Widgets mit eigenem Scrollverhalten auslassen
+        w = widget_under
+        in_content = False
+        while w is not None:
+            if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview,
+                              ttk.Combobox, ttk.Scrollbar)):
+                return
+            if w is self.content_canvas or w is self.content:
+                in_content = True
+                break
+            try:
+                w = w.master
+            except Exception:
+                break
+        if not in_content:
+            return
+
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        else:
+            delta = -1 if event.delta > 0 else 1
+        self.content_canvas.yview_scroll(delta, "units")
+
+    # ─────────────────────────────────────────────────────────
+    #  Step-Leiste (dynamisch)
     # ─────────────────────────────────────────────────────────
 
     def _get_steps(self):
-        if self.state["input_mode"] == "plaso":
+        mode = self.state["input_mode"]
+        if mode == "plaso":
             return ["Quelle", "Optionen", "Ausführen"]
+        if mode == "folder":
+            # Reine Ordner-Quelle: kein BitLocker, keine Partition
+            return ["Quelle", "Ausgabe", "Parser", "Optionen", "Ausführen"]
+        # single / batch
         return ["Quelle", "Ausgabe", "BitLocker", "Partition",
                 "Parser", "Optionen", "Ausführen"]
 
@@ -662,6 +717,12 @@ class PlasoWizard:
         for w in self.content.winfo_children():
             w.destroy()
 
+        # Scroll ganz nach oben bei Schrittwechsel
+        try:
+            self.content_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
         self._update_step_bar_colors()
 
         self.btn_back.configure(state="normal" if index > 0 else "disabled")
@@ -706,6 +767,9 @@ class PlasoWizard:
         elif step_name == "Optionen":
             if not self._validate_options_step():
                 return
+        elif step_name == "Ausführen":
+            # Export-Einstellungen wurden bereits in "Optionen" geprüft.
+            pass
 
         if self.current_step < len(self.steps) - 1:
             self._show_step(self.current_step + 1)
@@ -715,7 +779,7 @@ class PlasoWizard:
             self._start_processing()
 
     # ─────────────────────────────────────────────────────────
-    #  Validierung Schritt 1
+    #  Validierung je Schritt
     # ─────────────────────────────────────────────────────────
 
     def _validate_source_step(self):
@@ -726,16 +790,6 @@ class PlasoWizard:
             if not p or not Path(p).is_file():
                 messagebox.showerror("Fehler",
                     "Bitte eine gültige .plaso-Datei auswählen.")
-                return False
-            if not self.state.get("out_dir"):
-                messagebox.showerror("Fehler", "Bitte einen Zielordner wählen.")
-                return False
-            if not self.state.get("name"):
-                messagebox.showerror("Fehler", "Bitte einen Basis-Dateinamen angeben.")
-                return False
-            if not self.state.get("selected_formats"):
-                messagebox.showerror("Fehler",
-                    "Bitte mindestens ein Exportformat anhaken.")
                 return False
             return True
 
@@ -755,15 +809,13 @@ class PlasoWizard:
         return True
 
     def _validate_output_step(self):
+        # Image-/Ordner-/Batch-Modus: Zielordner + .plaso-Basisname
         if not self.state.get("out_dir"):
             messagebox.showerror("Fehler", "Bitte einen Ausgabeordner wählen.")
             return False
         if not self.state.get("name"):
-            messagebox.showerror("Fehler", "Bitte einen Dateinamen angeben.")
-            return False
-        if not self.state.get("selected_formats"):
             messagebox.showerror("Fehler",
-                "Bitte mindestens ein Ausgabeformat anhaken.")
+                "Bitte einen Basis-Dateinamen für die .plaso-Datei angeben.")
             return False
         return True
 
@@ -809,6 +861,7 @@ class PlasoWizard:
         return True
 
     def _validate_options_step(self):
+        # Zeitfilter-Validierung
         if self.time_filter_var.get():
             tf = self.time_from_var.get().strip()
             tt = self.time_to_var.get().strip()
@@ -837,6 +890,7 @@ class PlasoWizard:
             self.state["time_from"] = None
             self.state["time_to"] = None
 
+        # Preset-Filter
         self.state["filter_presets"] = {
             label for label, var in self.filter_vars.items() if var.get()
         }
@@ -856,10 +910,28 @@ class PlasoWizard:
                     f"Der Filterausdruck ist ungültig:\n\n{msg}\n\n"
                     f"Ausdruck:\n{preset_expr}")
                 return False
+
+        # Export-Einstellungen (für alle Modi hier prüfen)
+        if not self.state.get("name_export"):
+            messagebox.showerror("Fehler",
+                "Bitte einen Basis-Dateinamen für den Export angeben.")
+            return False
+        if not self.state.get("selected_formats"):
+            messagebox.showerror("Fehler",
+                "Bitte mindestens ein Exportformat anhaken.")
+            return False
+
+        # Zielordner nur im .plaso-Modus hier prüfen –
+        # im Image-/Ordner-/Batch-Modus kommt er aus "Ausgabe"
+        if self.state["input_mode"] == "plaso":
+            if not self.state.get("out_dir"):
+                messagebox.showerror("Fehler",
+                    "Bitte einen Zielordner wählen.")
+                return False
         return True
 
     # ══════════════════════════════════════════════════════════
-    #  Schritt 1: Quelle  (4 Modi, inkl. .plaso-Wiederverwendung)
+    #  Schritt 1: Quelle
     # ══════════════════════════════════════════════════════════
 
     def _step_source(self):
@@ -900,7 +972,7 @@ class PlasoWizard:
         self.batch_frame  = ttk.Frame(self.content)
         self.plaso_frame  = ttk.Frame(self.content)
 
-        # ── Einzel-Image ────────────────────────────────────
+        # Einzel-Image
         ttk.Label(self.single_frame, text="Pfad zum Image:",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         row = ttk.Frame(self.single_frame)
@@ -914,7 +986,7 @@ class PlasoWizard:
         ttk.Button(row, text="📂  Durchsuchen",
                    command=self._browse_image).pack(side="left")
 
-        # ── Ordner ──────────────────────────────────────────
+        # Ordner
         ttk.Label(self.folder_frame, text="Pfad zum Ordner:",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         frow = ttk.Frame(self.folder_frame)
@@ -928,7 +1000,7 @@ class PlasoWizard:
         ttk.Button(frow, text="📁  Ordner wählen",
                    command=self._browse_folder).pack(side="left")
 
-        # ── Batch ───────────────────────────────────────────
+        # Batch
         ttk.Label(self.batch_frame,
                   text="Ausgewählte Quellen (Images und/oder Ordner):",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
@@ -953,7 +1025,7 @@ class PlasoWizard:
         self.batch_list.pack(side="left", fill="both", expand=True)
         list_vsb.pack(side="right", fill="y")
 
-        # ── .plaso-Wiederverwendung ─────────────────────────
+        # .plaso-Panel (nur Datei-Auswahl)
         self._build_plaso_panel(self.plaso_frame)
 
         self.image_status = ttk.Label(self.content, text="", style="Muted.TLabel")
@@ -963,7 +1035,7 @@ class PlasoWizard:
         self._rebuild_batch_list()
 
     # ─────────────────────────────────────────────────────────
-    #  .plaso-Panel (inkl. Ziel, Name, Format)
+    #  .plaso-Panel: nur Datei-Auswahl
     # ─────────────────────────────────────────────────────────
 
     def _build_plaso_panel(self, parent):
@@ -972,7 +1044,9 @@ class PlasoWizard:
             text=("ℹ  Im .plaso-Modus wird log2timeline (und damit auch "
                   "BitLocker, Partition, Parser) übersprungen.\n"
                   "    Die .plaso-Datei wird read-only gemountet und NICHT "
-                  "verändert. Nur pinfo + psort laufen."),
+                  "verändert.\n"
+                  "    Zielordner, Export-Dateiname und Format wählst du im "
+                  "nächsten Schritt (Optionen)."),
             bg="#e7f1fb", fg="#0b4a80", justify="left",
             font=("Segoe UI", 9), padx=10, pady=6, anchor="w"
         ).pack(fill="x", pady=(0, 10))
@@ -992,100 +1066,51 @@ class PlasoWizard:
         self.existing_plaso_status = ttk.Label(
             parent, text="", style="Muted.TLabel",
             wraplength=900, justify="left")
-        self.existing_plaso_status.pack(anchor="w", pady=(4, 12))
+        self.existing_plaso_status.pack(anchor="w", pady=(4, 0))
         self.existing_plaso_var.trace(
             "w", lambda *a: self._validate_existing_plaso())
 
-        # Zielordner + Basisname + Formate (leben normalerweise in "Ausgabe")
-        self._build_output_section(parent)
-        self._build_format_section(parent,
-            info_text="ℹ  Du kannst mehrere Formate gleichzeitig wählen. "
-                      "Die .plaso-Datei wird nicht neu erzeugt – jedes "
-                      "Format wird direkt daraus exportiert.")
+    def _browse_existing_plaso(self):
+        path = filedialog.askopenfilename(
+            title="Vorhandene .plaso-Datei auswählen",
+            filetypes=[("Plaso Storage", "*.plaso"),
+                       ("Alle Dateien", "*.*")])
+        if path:
+            self.existing_plaso_var.set(path)
 
-        self.out_status = ttk.Label(parent, text="", style="Muted.TLabel",
-                                    wraplength=1100, justify="left")
-        self.out_status.pack(anchor="w", pady=(12, 0))
-        self._validate_out()
-
-    def _build_output_section(self, parent):
-        ttk.Label(parent, text="Zielordner:",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
-        out_row = ttk.Frame(parent)
-        out_row.pack(fill="x", pady=(5, 10))
-
-        default_dir = self.state.get("out_dir") or ""
-        if not default_dir:
-            if self.state["input_mode"] == "plaso" and \
-               self.state.get("existing_plaso_path"):
-                default_dir = str(Path(self.state["existing_plaso_path"]).parent)
-            elif self.state["input_mode"] == "folder" and self.state["input_path"]:
-                default_dir = str(Path(self.state["input_path"]).parent / "plaso")
-            elif self.state.get("input_dir"):
-                default_dir = str(Path(self.state["input_dir"]) / "plaso")
-            elif self.state["input_mode"] == "batch" and self.state["batch_items"]:
-                first = Path(self.state["batch_items"][0]["path"])
-                base = first.parent if first.is_file() else first
-                default_dir = str(base / "plaso")
-
-        self.out_dir_var = tk.StringVar(value=default_dir)
-        ttk.Entry(out_row, textvariable=self.out_dir_var,
-                  font=("Segoe UI", 10)).pack(
-            side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Button(out_row, text="📁  Ordner wählen",
-                   command=self._browse_outdir).pack(side="left")
-
-        ttk.Label(parent, text="Basis-Dateiname:",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(parent,
-                  text="(Erweiterung wird je nach Format automatisch gesetzt. "
-                       "Im Batch-Modus pro Quelle ein Unterordner.)",
-                  style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
-
-        self.filename_var = tk.StringVar(value=self.state["name"] or "timeline")
-        ttk.Entry(parent, textvariable=self.filename_var,
-                  font=("Segoe UI", 10)).pack(fill="x", pady=(0, 10))
-
-        self.out_dir_var.trace("w", lambda *a: self._validate_out())
-        self.filename_var.trace("w", lambda *a: self._validate_out())
-
-    def _build_format_section(self, parent, info_text):
-        ttk.Label(parent, text="Ausgabeformat(e):",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        tk.Label(parent, text=info_text, bg="#fff8dc", fg="#664d03",
-                 justify="left", font=("Segoe UI", 9),
-                 padx=10, pady=6, anchor="w").pack(fill="x", pady=(4, 8))
-
-        fmt_frame = ttk.Frame(parent)
-        fmt_frame.pack(fill="x", pady=(0, 6))
-
-        self.format_vars = {}
-        selected_values = {v for v, e in self.state["selected_formats"]}
-
-        for label, value, ext, desc in OUTPUT_FORMATS:
-            row = ttk.Frame(fmt_frame)
-            row.pack(fill="x", pady=2)
-            var = tk.BooleanVar(value=(value in selected_values))
-            self.format_vars[label] = var
-            ttk.Checkbutton(row, text=label, variable=var,
-                            command=self._on_format_change).pack(side="left")
-            if value == "l2tcsv":
-                desc_style = "Warn.TLabel"
-                desc = "⚠ Nur Sekunden-Genauigkeit – für DFIR ist JSON Lines oder XLSX empfohlen"
-            else:
-                desc_style = "Muted.TLabel"
-            ttk.Label(row, text=f"  {desc}",
-                      style=desc_style).pack(side="left")
+    def _validate_existing_plaso(self):
+        raw = self.existing_plaso_var.get().strip()
+        if not raw:
+            self.state["existing_plaso_path"] = None
+            self.existing_plaso_status.configure(text="")
+            return
+        p = Path(raw)
+        if p.is_file() and p.suffix.lower() == ".plaso":
+            self.state["existing_plaso_path"] = str(p.resolve())
+            try:
+                size_mb = p.stat().st_size / (1024 * 1024)
+                self.existing_plaso_status.configure(
+                    text=f"✔  {p.name}  ({size_mb:.1f} MB)",
+                    style="Success.TLabel")
+            except OSError as e:
+                self.existing_plaso_status.configure(
+                    text=f"✘  {e}", style="Error.TLabel")
+        else:
+            self.state["existing_plaso_path"] = None
+            self.existing_plaso_status.configure(
+                text="✘  Datei nicht gefunden oder keine .plaso-Datei.",
+                style="Error.TLabel")
 
     def _on_mode_change(self, initial=False):
         mode = self.mode_var.get()
         old_mode = self.state["input_mode"]
         self.state["input_mode"] = mode
 
-        # Step-Leiste anpassen, wenn Modus-Kategorie wechselt
-        old_is_plaso = (old_mode == "plaso")
-        new_is_plaso = (mode == "plaso")
-        if old_is_plaso != new_is_plaso:
+        old_is_plaso  = (old_mode == "plaso")
+        new_is_plaso  = (mode == "plaso")
+        old_is_folder = (old_mode == "folder")
+        new_is_folder = (mode == "folder")
+        if (old_is_plaso != new_is_plaso) or (old_is_folder != new_is_folder):
             self.steps = self._get_steps()
             self._rebuild_step_bar()
 
@@ -1106,131 +1131,7 @@ class PlasoWizard:
         self._validate_image(full=False)
 
     # ─────────────────────────────────────────────────────────
-    #  .plaso-Auswahl / Validierung
-    # ─────────────────────────────────────────────────────────
-
-    def _browse_existing_plaso(self):
-        path = filedialog.askopenfilename(
-            title="Vorhandene .plaso-Datei auswählen",
-            filetypes=[("Plaso Storage", "*.plaso"),
-                       ("Alle Dateien", "*.*")])
-        if path:
-            self.existing_plaso_var.set(path)
-
-    def _validate_existing_plaso(self):
-        raw = self.existing_plaso_var.get().strip()
-        if not raw:
-            self.state["existing_plaso_path"] = None
-            self.existing_plaso_status.configure(text="")
-            self._validate_out()
-            return
-        p = Path(raw)
-        if p.is_file() and p.suffix.lower() == ".plaso":
-            self.state["existing_plaso_path"] = str(p.resolve())
-            # Wenn Zielordner noch leer → auf .plaso-Verzeichnis setzen
-            if not self.out_dir_var.get().strip():
-                self.out_dir_var.set(str(p.parent))
-            try:
-                size_mb = p.stat().st_size / (1024 * 1024)
-                self.existing_plaso_status.configure(
-                    text=f"✔  {p.name}  ({size_mb:.1f} MB)",
-                    style="Success.TLabel")
-            except OSError as e:
-                self.existing_plaso_status.configure(
-                    text=f"✘  {e}", style="Error.TLabel")
-        else:
-            self.state["existing_plaso_path"] = None
-            self.existing_plaso_status.configure(
-                text="✘  Datei nicht gefunden oder keine .plaso-Datei.",
-                style="Error.TLabel")
-        self._validate_out()
-
-    # ─────────────────────────────────────────────────────────
-    #  Formate / Zielordner-Validierung (gemeinsam genutzt)
-    # ─────────────────────────────────────────────────────────
-
-    def _on_format_change(self):
-        selected = []
-        for label, value, ext, desc in OUTPUT_FORMATS:
-            if self.format_vars.get(label) and self.format_vars[label].get():
-                selected.append((value, ext))
-        self.state["selected_formats"] = selected
-        self._validate_out()
-
-    def _browse_outdir(self):
-        path = filedialog.askdirectory(title="Zielordner wählen")
-        if path:
-            self.out_dir_var.set(path)
-
-    def _validate_out(self):
-        if not hasattr(self, "out_dir_var") or not hasattr(self, "filename_var"):
-            return
-        out_dir = self.out_dir_var.get().strip()
-        name = self.filename_var.get().strip() or "timeline"
-
-        for _, _, ext, _ in OUTPUT_FORMATS:
-            if name.lower().endswith(ext):
-                name = name[:-len(ext)]
-                break
-
-        if not out_dir:
-            self.state["out_dir"] = None
-            self.state["name"] = None
-            if hasattr(self, "out_status"):
-                self.out_status.configure(text="")
-            return
-        try:
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            self.state["out_dir"] = str(Path(out_dir).resolve())
-            self.state["name"] = name
-
-            if not self.state["selected_formats"]:
-                if hasattr(self, "out_status"):
-                    self.out_status.configure(
-                        text="⚠  Kein Ausgabeformat ausgewählt – "
-                             "bitte mindestens eines anhaken.",
-                        style="Error.TLabel")
-                return
-
-            mode = self.state["input_mode"]
-
-            if mode == "plaso":
-                plaso_src = Path(self.state["existing_plaso_path"]).name \
-                    if self.state.get("existing_plaso_path") else "?"
-                files = [f"{self.state['out_dir']}\\{name}{ext}"
-                         for _, ext in self.state["selected_formats"]]
-                preview = files[0]
-                if len(files) > 1:
-                    preview += f"   (+{len(files) - 1} weitere)"
-                if hasattr(self, "out_status"):
-                    self.out_status.configure(
-                        text=f"✔  Quelle: {plaso_src}  (read-only)\n"
-                             f"✔  Ziel:   {preview}\n"
-                             f"ℹ  log2timeline wird übersprungen – "
-                             f"nur pinfo + psort laufen.",
-                        style="Success.TLabel")
-                return
-
-            if mode == "batch":
-                preview = (f"{self.state['out_dir']}\\<NN_quelle>\\{name}"
-                           f"<endung>   (Unterordner pro Quelle)")
-            else:
-                files = [f"{self.state['out_dir']}\\{name}{ext}"
-                         for _, ext in self.state["selected_formats"]]
-                preview = files[0]
-                if len(files) > 1:
-                    preview += f"   (+{len(files) - 1} weitere)"
-            if hasattr(self, "out_status"):
-                self.out_status.configure(text=f"✔  {preview}",
-                                          style="Success.TLabel")
-        except OSError as e:
-            self.state["out_dir"] = None
-            if hasattr(self, "out_status"):
-                self.out_status.configure(text=f"✘  {e}",
-                                          style="Error.TLabel")
-
-    # ─────────────────────────────────────────────────────────
-    #  Image-/Ordner-/Batch-Browse + Validierung
+    #  Image / Ordner / Batch – Hilfsmethoden
     # ─────────────────────────────────────────────────────────
 
     def _browse_image(self):
@@ -1420,8 +1321,10 @@ class PlasoWizard:
                 self.image_status.configure(text="", style="Muted.TLabel")
 
         elif mode == "batch":
-            n_img = sum(1 for i in self.state["batch_items"] if i["type"] == "image")
-            n_dir = sum(1 for i in self.state["batch_items"] if i["type"] == "folder")
+            n_img = sum(1 for i in self.state["batch_items"]
+                        if i["type"] == "image")
+            n_dir = sum(1 for i in self.state["batch_items"]
+                        if i["type"] == "folder")
             if not self.state["batch_items"]:
                 self.image_status.configure(text="")
             else:
@@ -1434,28 +1337,96 @@ class PlasoWizard:
                     style="Success.TLabel")
 
     # ══════════════════════════════════════════════════════════
-    #  Schritt 2: Ausgabe  (nur Image-Modi)
+    #  Schritt 2: Ausgabe  (Image-/Ordner-/Batch-Modus)
+    #     - Zielordner
+    #     - Basis-Name der .plaso-Datei
     # ══════════════════════════════════════════════════════════
 
     def _step_output(self):
-        ttk.Label(self.content, text="Ausgabeort & Dateiname",
+        ttk.Label(self.content, text="Ausgabeort & .plaso-Dateiname",
                   style="Title.TLabel").pack(anchor="w", pady=(5, 3))
         ttk.Label(self.content,
-                  text="Hierhin werden die .plaso-Datei und die Exporte "
-                       "gespeichert.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+                  text="Hier wird die .plaso-Storage-Datei von log2timeline "
+                       "gespeichert. Den Namen und das Format der Export-Datei "
+                       "wählst du später im Schritt Optionen.",
+                  style="Muted.TLabel", wraplength=950,
+                  justify="left").pack(anchor="w", pady=(0, 15))
 
-        self._build_output_section(self.content)
-        self._build_format_section(self.content,
-            info_text="ℹ  Du kannst mehrere Formate gleichzeitig wählen. "
-                      "Die .plaso-Datei wird einmal erzeugt – jedes weitere "
-                      "Format wird daraus exportiert.")
+        self._build_dir_and_plaso_name(self.content)
 
         self.out_status = ttk.Label(self.content, text="",
                                     style="Muted.TLabel",
                                     wraplength=1100, justify="left")
-        self.out_status.pack(anchor="w", pady=(12, 0))
-        self._validate_out()
+        self.out_status.pack(anchor="w", pady=(15, 0))
+
+        self._validate_out_dir_and_name()
+
+    def _build_dir_and_plaso_name(self, parent):
+        ttk.Label(parent, text="Zielordner:",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        out_row = ttk.Frame(parent)
+        out_row.pack(fill="x", pady=(5, 12))
+
+        default_dir = self.state.get("out_dir") or ""
+        if not default_dir:
+            if self.state["input_mode"] == "folder" and self.state["input_path"]:
+                default_dir = str(Path(self.state["input_path"]).parent / "plaso")
+            elif self.state.get("input_dir"):
+                default_dir = str(Path(self.state["input_dir"]) / "plaso")
+            elif self.state["input_mode"] == "batch" and self.state["batch_items"]:
+                first = Path(self.state["batch_items"][0]["path"])
+                base = first.parent if first.is_file() else first
+                default_dir = str(base / "plaso")
+
+        self.out_dir_var = tk.StringVar(value=default_dir)
+        ttk.Entry(out_row, textvariable=self.out_dir_var,
+                  font=("Segoe UI", 10)).pack(
+            side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(out_row, text="📁  Ordner wählen",
+                   command=self._browse_outdir).pack(side="left")
+
+        ttk.Label(parent, text="Basis-Dateiname (.plaso):",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(parent,
+                  text="'.plaso' wird automatisch angehängt.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        self.filename_var = tk.StringVar(
+            value=self.state.get("name") or "timeline")
+        ttk.Entry(parent, textvariable=self.filename_var,
+                  font=("Segoe UI", 10)).pack(fill="x", pady=(0, 10))
+
+        self.out_dir_var.trace("w", lambda *a: self._validate_out_dir_and_name())
+        self.filename_var.trace("w", lambda *a: self._validate_out_dir_and_name())
+
+    def _browse_outdir(self):
+        path = filedialog.askdirectory(title="Zielordner wählen")
+        if path:
+            self.out_dir_var.set(path)
+
+    def _validate_out_dir_and_name(self):
+        out_dir = self.out_dir_var.get().strip()
+        name = strip_known_extensions(self.filename_var.get().strip() or "timeline")
+
+        if not out_dir:
+            self.state["out_dir"] = None
+            self.state["name"] = None
+            if hasattr(self, "out_status"):
+                self.out_status.configure(text="")
+            return
+        try:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            self.state["out_dir"] = str(Path(out_dir).resolve())
+            self.state["name"] = name
+            if hasattr(self, "out_status"):
+                self.out_status.configure(
+                    text=f"✔  .plaso → "
+                         f"{self.state['out_dir']}\\{name}.plaso",
+                    style="Success.TLabel")
+        except OSError as e:
+            self.state["out_dir"] = None
+            if hasattr(self, "out_status"):
+                self.out_status.configure(text=f"✘  {e}",
+                                          style="Error.TLabel")
 
     # ══════════════════════════════════════════════════════════
     #  Schritt 3: BitLocker
@@ -2018,31 +1989,90 @@ class PlasoWizard:
                 text=f"✔  {n} Parser ausgewählt", style="Success.TLabel")
 
     # ══════════════════════════════════════════════════════════
-    #  Schritt 6: Optionen  (in beiden Modi vorhanden)
+    #  Schritt 6: Optionen
+    #     Image/Ordner/Batch: Export-Name + Format + Filter/Zeitraum
+    #     .plaso-Modus:      Ziel + Export-Name + Format
+    #                        + Filter/Zeitraum
     # ══════════════════════════════════════════════════════════
 
     def _step_options(self):
         ttk.Label(self.content, text="Optionen",
                   style="Title.TLabel").pack(anchor="w", pady=(5, 3))
         ttk.Label(self.content,
-                  text="Zusätzliche Filter und Optionen für den Export.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(0, 20))
+                  text="Export- und Filteroptionen für den psort-Export.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 15))
 
-        ttk.Label(self.content, text="Filterzeitraum",
+        # ═════════════════════════════════════════════════════════
+        #  1) psort-Filter (Preset)
+        # ═════════════════════════════════════════════════════════
+        ttk.Label(self.content, text="psort-Filter (Preset)",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(self.content,
+                  text="Wähle, welche Ereignisse exportiert werden sollen. "
+                       "Der Filter wirkt nur beim Export – die .plaso-Datei "
+                       "enthält weiterhin alle Ereignisse.\n"
+                       "Der Filterausdruck wird im Log protokolliert.",
+                  style="Muted.TLabel", wraplength=950,
+                  justify="left").pack(anchor="w", pady=(0, 8))
+
+        preset_container = ttk.Frame(self.content)
+        preset_container.pack(fill="x", pady=(0, 8))
+
+        self.filter_vars = {}
+        for label, expression in PSORT_FILTER_PRESETS:
+            var = tk.BooleanVar(value=(label in self.state["filter_presets"]))
+            self.filter_vars[label] = var
+            ttk.Checkbutton(
+                preset_container, text=label, variable=var,
+                command=lambda l=label: self._on_filter_preset_change(l)
+            ).pack(anchor="w", pady=2)
+
+        self.filter_preview_lbl = ttk.Label(
+            self.content, text="", style="Muted.TLabel",
+            wraplength=950, justify="left")
+        self.filter_preview_lbl.pack(anchor="w", pady=(0, 8), fill="x")
+
+        self.filter_custom_frame = ttk.LabelFrame(
+            self.content, text="Eigener Filterausdruck", padding=10)
+        ttk.Label(
+            self.filter_custom_frame,
+            text="psort-Filterausdruck (Syntax: data_type, parser, source, "
+                 "date; Operatoren: is, contains, and, or, not, (), "
+                 "Vergleiche)",
+            style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        self.filter_custom_var = tk.StringVar(
+            value=self.state.get("filter_custom", ""))
+        custom_ent = ttk.Entry(self.filter_custom_frame,
+                               textvariable=self.filter_custom_var,
+                               font=("Consolas", 9))
+        custom_ent.pack(fill="x", pady=(0, 4))
+        custom_ent.bind("<KeyRelease>",
+                        lambda e: self._update_filter_preview())
+        ttk.Label(
+            self.filter_custom_frame,
+            text="Beispiel: data_type contains 'windows:registry:run' "
+                 "and source contains 'NTUSER'",
+            style="Muted.TLabel").pack(anchor="w")
+
+        # ═════════════════════════════════════════════════════════
+        #  2) Filterzeitraum
+        # ═════════════════════════════════════════════════════════
+        ttk.Label(self.content, text="Filterzeitraum",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(25, 6))
         ttk.Label(self.content,
                   text="Nur Ereignisse aus einem bestimmten Zeitraum exportieren. "
                        "Der Filter wirkt erst beim psort-Export – "
                        "die .plaso-Datei enthält weiterhin alle Ereignisse.\n"
                        "Die Eingabe erfolgt in UTC (Plaso-Standard).",
-                  style="Muted.TLabel", wraplength=900,
+                  style="Muted.TLabel", wraplength=950,
                   justify="left").pack(anchor="w", pady=(0, 8))
 
         self.time_filter_var = tk.BooleanVar(
             value=self.state["time_filter_enabled"])
         ttk.Checkbutton(self.content, text="Zeitfilter aktivieren",
                         variable=self.time_filter_var,
-                        command=self._toggle_time_filter).pack(anchor="w", pady=(0, 10))
+                        command=self._toggle_time_filter).pack(
+            anchor="w", pady=(0, 10))
 
         self.time_frame = ttk.LabelFrame(self.content,
                                          text="Filterzeitraum (Eingabe in UTC)",
@@ -2073,59 +2103,212 @@ class PlasoWizard:
                   text="Beispiel: 2026-09-26 08:00:00 bis 2026-09-26 18:00:15",
                   style="Muted.TLabel").pack(anchor="w", pady=(5, 0))
 
-        self._toggle_time_filter()
-
-        # ── psort-Filter (Preset) ──────────────────────────────
-        ttk.Label(self.content, text="psort-Filter (Preset)",
+        # ═════════════════════════════════════════════════════════
+        #  3) Ziel & Export
+        # ═════════════════════════════════════════════════════════
+        ttk.Label(self.content, text="Ziel & Export",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(25, 6))
-        ttk.Label(self.content,
-                  text="Wähle, welche Ereignisse exportiert werden sollen. "
-                       "Der Filter wirkt nur beim Export – die .plaso-Datei "
-                       "enthält weiterhin alle Ereignisse.\n"
-                       "Der Filterausdruck wird im Log protokolliert.",
-                  style="Muted.TLabel", wraplength=900,
-                  justify="left").pack(anchor="w", pady=(0, 8))
 
-        preset_container = ttk.Frame(self.content)
-        preset_container.pack(fill="x", pady=(0, 8))
+        if self.state["input_mode"] == "plaso":
+            # .plaso-Modus: Zielordner + Export-Name + Format
+            box = ttk.LabelFrame(self.content,
+                                 text="Ziel & Export", padding=12)
+            box.pack(fill="x", pady=(0, 15))
+            self._build_dir_and_export_name_and_format(
+                box, show_dir_hint="Zielordner für den psort-Export.")
+            self.out_status = ttk.Label(box, text="",
+                                        style="Muted.TLabel",
+                                        wraplength=1050, justify="left")
+            self.out_status.pack(anchor="w", pady=(10, 0))
+            self._validate_export_section()
+        else:
+            # Image/Ordner/Batch: Zielordner steht bereits in "Ausgabe" →
+            # hier nur Export-Name + Format
+            box = ttk.LabelFrame(self.content,
+                                 text="Export (psort)", padding=12)
+            box.pack(fill="x", pady=(0, 15))
+            self._build_export_name_and_format_only(box)
 
-        self.filter_vars = {}
-        for label, expression in PSORT_FILTER_PRESETS:
-            var = tk.BooleanVar(value=(label in self.state["filter_presets"]))
-            self.filter_vars[label] = var
-            ttk.Checkbutton(
-                preset_container, text=label, variable=var,
-                command=self._on_filter_preset_change
-            ).pack(anchor="w", pady=2)
-
-        self.filter_preview_lbl = ttk.Label(
-            self.content, text="", style="Muted.TLabel",
-            wraplength=900, justify="left")
-        self.filter_preview_lbl.pack(anchor="w", pady=(0, 8), fill="x")
-
-        self.filter_custom_frame = ttk.LabelFrame(
-            self.content, text="Eigener Filterausdruck", padding=10)
-        ttk.Label(
-            self.filter_custom_frame,
-            text="psort-Filterausdruck (Syntax: data_type, parser, source, "
-                 "date; Operatoren: is, contains, and, or, not, (), "
-                 "Vergleiche)",
-            style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
-        self.filter_custom_var = tk.StringVar(
-            value=self.state.get("filter_custom", ""))
-        custom_ent = ttk.Entry(self.filter_custom_frame,
-                               textvariable=self.filter_custom_var,
-                               font=("Consolas", 9))
-        custom_ent.pack(fill="x", pady=(0, 4))
-        custom_ent.bind("<KeyRelease>",
-                        lambda e: self._update_filter_preview())
-        ttk.Label(
-            self.filter_custom_frame,
-            text="Beispiel: data_type contains 'windows:registry:run' "
-                 "and source contains 'NTUSER'",
-            style="Muted.TLabel").pack(anchor="w")
-
+        # Initialisierung (muss NACH allen Widget-Erstellungen laufen)
+        self._toggle_time_filter()
         self._on_filter_preset_change()
+
+    # ─────────────────────────────────────────────────────────
+    #  Zielordner + Export-Name + Format (nur .plaso-Modus)
+    # ─────────────────────────────────────────────────────────
+
+    def _build_dir_and_export_name_and_format(self, parent,
+                                              show_dir_hint=None):
+        # Zielordner
+        ttk.Label(parent, text="Zielordner:",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        if show_dir_hint:
+            ttk.Label(parent, text=show_dir_hint,
+                      style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+
+        out_row = ttk.Frame(parent)
+        out_row.pack(fill="x", pady=(4, 12))
+
+        default_dir = self.state.get("out_dir") or ""
+        if not default_dir:
+            if self.state["input_mode"] == "plaso" and \
+               self.state.get("existing_plaso_path"):
+                default_dir = str(Path(self.state["existing_plaso_path"]).parent)
+            elif self.state["input_mode"] == "batch" and \
+                 self.state["batch_items"]:
+                first = Path(self.state["batch_items"][0]["path"])
+                base = first.parent if first.is_file() else first
+                default_dir = str(base / "plaso")
+
+        self.out_dir_var = tk.StringVar(value=default_dir)
+        ttk.Entry(out_row, textvariable=self.out_dir_var,
+                  font=("Segoe UI", 10)).pack(
+            side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(out_row, text="📁  Ordner wählen",
+                   command=self._browse_outdir).pack(side="left")
+
+        # Export-Name + Format
+        self._build_export_name_and_format_only(parent,
+                                                with_status=False)
+
+        self.out_dir_var.trace(
+            "w", lambda *a: self._validate_export_section())
+
+    # ─────────────────────────────────────────────────────────
+    #  Export-Name + Format (ohne Zielordner)
+    # ─────────────────────────────────────────────────────────
+
+    def _build_export_name_and_format_only(self, parent,
+                                           with_status=True):
+        # Export-Name
+        ttk.Label(parent, text="Basis-Dateiname (Export):",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(parent,
+                  text="Name der Export-Datei (psort). Die Erweiterung wird "
+                       "je nach Ausgabeformat automatisch gesetzt.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+
+        default_export = self.state.get("name_export") or "timeline_export"
+        self.filename_export_var = tk.StringVar(value=default_export)
+        ttk.Entry(parent, textvariable=self.filename_export_var,
+                  font=("Segoe UI", 10)).pack(fill="x", pady=(0, 12))
+
+        # Formate
+        ttk.Label(parent, text="Ausgabeformat(e):",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(parent,
+                 text="ℹ  Du kannst mehrere Formate gleichzeitig wählen. "
+                      "Jedes Format erzeugt eine eigene Export-Datei.",
+                 bg="#fff8dc", fg="#664d03", justify="left",
+                 font=("Segoe UI", 9), padx=10, pady=6,
+                 anchor="w").pack(fill="x", pady=(4, 8))
+
+        fmt_frame = ttk.Frame(parent)
+        fmt_frame.pack(fill="x", pady=(0, 4))
+
+        self.format_vars = {}
+        selected_values = {v for v, e in self.state["selected_formats"]}
+
+        for label, value, ext, desc in OUTPUT_FORMATS:
+            row = ttk.Frame(fmt_frame)
+            row.pack(fill="x", pady=2)
+            var = tk.BooleanVar(value=(value in selected_values))
+            self.format_vars[label] = var
+            ttk.Checkbutton(row, text=label, variable=var,
+                            command=self._on_format_change).pack(side="left")
+            if value == "l2tcsv":
+                desc_style = "Warn.TLabel"
+                desc = ("⚠ Nur Sekunden-Genauigkeit – für DFIR ist "
+                        "JSON Lines oder XLSX empfohlen")
+            else:
+                desc_style = "Muted.TLabel"
+            ttk.Label(row, text=f"  {desc}",
+                      style=desc_style).pack(side="left")
+
+        self.filename_export_var.trace(
+            "w", lambda *a: self._validate_export_section())
+
+        if with_status:
+            self.out_status = ttk.Label(parent, text="",
+                                        style="Muted.TLabel",
+                                        wraplength=1050, justify="left")
+            self.out_status.pack(anchor="w", pady=(10, 0))
+
+        self._validate_export_section()
+
+    def _on_format_change(self):
+        selected = []
+        for label, value, ext, desc in OUTPUT_FORMATS:
+            if self.format_vars.get(label) and self.format_vars[label].get():
+                selected.append((value, ext))
+        self.state["selected_formats"] = selected
+        self._validate_export_section()
+        # Summary im Ausführen-Schritt neu zeichnen, falls sichtbar
+        if hasattr(self, "run_summary_frame") and \
+           self.run_summary_frame.winfo_exists():
+            self._build_run_summary()
+
+    def _validate_export_section(self):
+        if not hasattr(self, "filename_export_var"):
+            return
+
+        name_export = strip_known_extensions(
+            self.filename_export_var.get().strip() or "timeline_export")
+        self.state["name_export"] = name_export
+
+        # Zielordner (nur prüfen, wenn Eingabefeld existiert –
+        # im Image/Ordner/Batch-Modus wird er in "Ausgabe" gesetzt)
+        if hasattr(self, "out_dir_var"):
+            out_dir = self.out_dir_var.get().strip()
+            if not out_dir:
+                self.state["out_dir"] = None
+                if hasattr(self, "out_status"):
+                    self.out_status.configure(text="")
+                return
+            try:
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                self.state["out_dir"] = str(Path(out_dir).resolve())
+            except OSError as e:
+                self.state["out_dir"] = None
+                if hasattr(self, "out_status"):
+                    self.out_status.configure(text=f"✘  {e}",
+                                              style="Error.TLabel")
+                return
+
+        if not self.state.get("out_dir"):
+            return
+
+        if not self.state["selected_formats"]:
+            if hasattr(self, "out_status"):
+                self.out_status.configure(
+                    text="⚠  Kein Ausgabeformat ausgewählt – "
+                         "bitte mindestens eines anhaken.",
+                    style="Error.TLabel")
+            return
+
+        files = [f"{self.state['out_dir']}\\{name_export}{ext}"
+                 for _, ext in self.state["selected_formats"]]
+        preview = files[0]
+        if len(files) > 1:
+            preview += f"   (+{len(files) - 1} weitere)"
+
+        if hasattr(self, "out_status"):
+            if self.state["input_mode"] == "plaso":
+                src = (Path(self.state["existing_plaso_path"]).name
+                       if self.state.get("existing_plaso_path") else "?")
+                self.out_status.configure(
+                    text=f"✔  Quelle:  {src}  (read-only)\n"
+                         f"✔  Export:  {preview}\n"
+                         f"ℹ  log2timeline wird übersprungen – "
+                         f"nur pinfo + psort laufen.",
+                    style="Success.TLabel")
+            else:
+                self.out_status.configure(text=f"✔  Export → {preview}",
+                                          style="Success.TLabel")
+
+    # ─────────────────────────────────────────────────────────
+    #  Filter-Helfer
+    # ─────────────────────────────────────────────────────────
 
     def _toggle_time_filter(self):
         if self.time_filter_var.get():
@@ -2169,25 +2352,31 @@ class PlasoWizard:
             return None
         return " and ".join(parts)
 
-    def _on_filter_preset_change(self):
+    def _on_filter_preset_change(self, clicked_label=None):
         all_label = "Alles (kein Filter)"
         all_var = self.filter_vars.get(all_label)
+        if all_var is None:
+            return
 
-        if all_var and all_var.get():
-            for label, var in self.filter_vars.items():
-                if label != all_label:
-                    var.set(False)
-        else:
-            any_other = any(var.get() for label, var in self.filter_vars.items()
-                            if label != all_label)
-            if any_other and all_var:
+        if clicked_label == all_label:
+            # Nutzer hat "Alles (kein Filter)" angeklickt → alle anderen aus
+            if all_var.get():
+                for label, var in self.filter_vars.items():
+                    if label != all_label:
+                        var.set(False)
+        elif clicked_label is not None:
+            # Nutzer hat einen bestimmten Filter angeklickt → "Alles" aus
+            if self.filter_vars[clicked_label].get():
                 all_var.set(False)
+        # clicked_label is None → nur State/Preview aktualisieren (Initialisierung)
 
+        # State übernehmen
         self.state["filter_presets"] = {
             label for label, var in self.filter_vars.items() if var.get()
         }
         self.state["filter_custom"] = self.filter_custom_var.get()
 
+        # Custom-Feld ein-/ausblenden
         if self.filter_vars.get("Eigener Filter …") and \
            self.filter_vars["Eigener Filter …"].get():
             self.filter_custom_frame.pack(fill="x", pady=(5, 0))
@@ -2222,14 +2411,57 @@ class PlasoWizard:
 
     # ══════════════════════════════════════════════════════════
     #  Letzter Schritt: Ausführen
+    #     Nur Zusammenfassung + Fortschritt + Log
     # ══════════════════════════════════════════════════════════
 
     def _step_run(self):
-        ttk.Label(self.content, text="Verarbeitung starten",
+        ttk.Label(self.content,
+                  text="Zusammenfassung & Start",
                   style="Title.TLabel").pack(anchor="w", pady=(5, 12))
 
-        summary = ttk.LabelFrame(self.content, text="Zusammenfassung", padding=15)
-        summary.pack(fill="x", pady=(0, 15))
+        # Zusammenfassung (rebuildable)
+        self.run_summary_frame = ttk.LabelFrame(
+            self.content, text="Zusammenfassung", padding=15)
+        self.run_summary_frame.pack(fill="x", pady=(0, 15))
+        self._build_run_summary()
+
+        # Fortschritt + Log
+        prog_frame = ttk.Frame(self.content)
+        prog_frame.pack(fill="x", pady=(5, 10))
+        self.progress = ttk.Progressbar(prog_frame, mode="determinate",
+                                        maximum=100)
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.timer_lbl = ttk.Label(prog_frame, text="00:00:00",
+                                   style="Timer.TLabel", width=12, anchor="e")
+        self.timer_lbl.pack(side="right", padx=(10, 0))
+
+        ttk.Label(self.content, text="Live-Ausgabe:",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(5, 4))
+
+        log_frame = ttk.Frame(self.content)
+        log_frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_frame, wrap="none", height=15,
+                                font=("Consolas", 9),
+                                bg="#1e1e1e", fg="#d4d4d4",
+                                insertbackground="white")
+        log_vsb = ttk.Scrollbar(log_frame, orient="vertical",
+                                command=self.log_text.yview)
+        log_hsb = ttk.Scrollbar(log_frame, orient="horizontal",
+                                command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=log_vsb.set,
+                                xscrollcommand=log_hsb.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_vsb.grid(row=0, column=1, sticky="ns")
+        log_hsb.grid(row=1, column=0, sticky="ew")
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        self.log_text.configure(state="disabled")
+
+    # ─────────────────────────────────────────────────────────
+
+    def _build_run_summary(self):
+        for w in self.run_summary_frame.winfo_children():
+            w.destroy()
 
         labels_by_value = {v: l for l, v, e, d in OUTPUT_FORMATS}
         selected_labels = [labels_by_value.get(v, v)
@@ -2238,15 +2470,18 @@ class PlasoWizard:
 
         use_existing = (self.state["input_mode"] == "plaso")
         mode = self.state["input_mode"]
+        name_export = self.state.get("name_export") or "timeline_export"
 
-        # Quell-Anzeige
+        # Quelle
         if use_existing:
             src = Path(self.state["existing_plaso_path"]).name \
                 if self.state.get("existing_plaso_path") else "?"
             img_display = f"[.plaso] {src}"
         elif mode == "batch":
-            n_img = sum(1 for i in self.state["batch_items"] if i["type"] == "image")
-            n_dir = sum(1 for i in self.state["batch_items"] if i["type"] == "folder")
+            n_img = sum(1 for i in self.state["batch_items"]
+                        if i["type"] == "image")
+            n_dir = sum(1 for i in self.state["batch_items"]
+                        if i["type"] == "folder")
             parts = []
             if n_img: parts.append(f"{n_img} Image(s)")
             if n_dir: parts.append(f"{n_dir} Ordner")
@@ -2256,14 +2491,18 @@ class PlasoWizard:
         else:
             img_display = self.state["input_path"] or "-"
 
-        # Ziel-Anzeige
-        if mode == "batch" and not use_existing:
+        # Ziel
+        if use_existing:
+            out_display = (f"{self.state['out_dir']}\\{name_export}<endung>"
+                           if self.state["out_dir"] else "-")
+        elif mode == "batch":
             out_display = (f"{self.state['out_dir']}\\<NN_quelle>\\"
-                           f"{self.state['name']}<endung>  "
-                           f"(Unterordner pro Quelle)"
+                           f"<NN_quelle>.plaso  →  "
+                           f"<NN_quelle>_export<endung>"
                            if self.state["out_dir"] else "-")
         else:
-            out_display = (f"{self.state['out_dir']}\\{self.state['name']}"
+            out_display = (f"{self.state['out_dir']}\\{self.state['name']}.plaso"
+                           f"  →  {name_export}<endung>"
                            if self.state["out_dir"] else "-")
 
         if self.state["time_filter_enabled"]:
@@ -2298,6 +2537,13 @@ class PlasoWizard:
             partition_display = "(übersprungen)"
             vss_row_display = "(übersprungen)"
             bitlocker_display = "(übersprungen)"
+        elif mode == "folder":
+            pipeline_display = "log2timeline → pinfo → psort"
+            parser_display = (f"{len(parsers)} ausgewählt"
+                              if parsers else "automatische Erkennung")
+            partition_display = "(nicht anwendbar – Ordner-Quelle)"
+            vss_row_display = "(nicht anwendbar – Ordner-Quelle)"
+            bitlocker_display = "(nicht anwendbar – Ordner-Quelle)"
         else:
             pipeline_display = "log2timeline → pinfo → psort"
             parser_display = (f"{len(parsers)} ausgewählt"
@@ -2323,7 +2569,7 @@ class PlasoWizard:
             ("Zeitzone",    OUTPUT_TIMEZONE or "UTC (Standard)"),
         ]
         for k, v in rows:
-            row = ttk.Frame(summary)
+            row = ttk.Frame(self.run_summary_frame)
             row.pack(fill="x", pady=2)
             ttk.Label(row, text=f"{k}:", width=14,
                       font=("Segoe UI", 10, "bold")).pack(side="left")
@@ -2332,7 +2578,7 @@ class PlasoWizard:
 
         if use_existing:
             info = tk.Label(
-                summary,
+                self.run_summary_frame,
                 text=("ℹ  Wiederverwendung aktiv: log2timeline wird "
                       "übersprungen.\n"
                       "    Die vorhandene .plaso-Datei wird read-only "
@@ -2343,45 +2589,16 @@ class PlasoWizard:
 
         if physical_selected and folder_mode and not use_existing:
             warn = tk.Label(
-                summary,
+                self.run_summary_frame,
                 text=(f"⚠  Physische Parser ausgewählt, aber Ordner-Quelle aktiv:\n"
                       f"    {', '.join(sorted(physical_selected))}\n"
-                      f"    Diese Parser benötigen ein physisches Image (E01/dd/raw)\n"
+                      f"    Diese Parser benötigen ein physisches Image "
+                      f"(E01/dd/raw)\n"
                       f"    ODER einen KAPE-Ordner mit den passenden Rohdateien\n"
                       f"    ($MFT, $UsnJrnl:$J, Bodyfile, …)."),
                 bg="#fff3cd", fg="#856404", justify="left",
                 font=("Segoe UI", 9), padx=10, pady=6, anchor="w")
             warn.pack(fill="x", pady=(8, 0))
-
-        prog_frame = ttk.Frame(self.content)
-        prog_frame.pack(fill="x", pady=(5, 10))
-        self.progress = ttk.Progressbar(prog_frame, mode="determinate", maximum=100)
-        self.progress.pack(side="left", fill="x", expand=True)
-        self.timer_lbl = ttk.Label(prog_frame, text="00:00:00",
-                                   style="Timer.TLabel", width=12, anchor="e")
-        self.timer_lbl.pack(side="right", padx=(10, 0))
-
-        ttk.Label(self.content, text="Live-Ausgabe:",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(5, 4))
-
-        log_frame = ttk.Frame(self.content)
-        log_frame.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_frame, wrap="none", height=18,
-                                font=("Consolas", 9),
-                                bg="#1e1e1e", fg="#d4d4d4",
-                                insertbackground="white")
-        log_vsb = ttk.Scrollbar(log_frame, orient="vertical",
-                                command=self.log_text.yview)
-        log_hsb = ttk.Scrollbar(log_frame, orient="horizontal",
-                                command=self.log_text.xview)
-        self.log_text.configure(yscrollcommand=log_vsb.set,
-                                xscrollcommand=log_hsb.set)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        log_vsb.grid(row=0, column=1, sticky="ns")
-        log_hsb.grid(row=1, column=0, sticky="ew")
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
-        self.log_text.configure(state="disabled")
 
     # ══════════════════════════════════════════════════════════
     #  Verarbeitung
@@ -2492,7 +2709,6 @@ class PlasoWizard:
         return True
 
     def _preflight_check(self):
-        # 1. Docker verfügbar?
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             result = subprocess.run(
@@ -2519,13 +2735,11 @@ class PlasoWizard:
             messagebox.showerror("Docker-Fehler", f"Unerwarteter Fehler:\n{e}")
             return False
 
-        # 2. Docker-Image-Digest prüfen
         if not self._check_docker_image_digest():
             self.log_queue.put(
                 "Abbruch: Docker-Image-Digest-Prüfung fehlgeschlagen.\n")
             return False
 
-        # 3. Quell-Validierung je Modus
         mode = self.state["input_mode"]
         if mode == "plaso":
             p = self.state.get("existing_plaso_path")
@@ -2549,7 +2763,6 @@ class PlasoWizard:
                     "Die Eingabequelle wurde nicht gefunden.")
                 return False
 
-        # 4. Output-Ordner
         out_dir = self.state["out_dir"]
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -2558,16 +2771,11 @@ class PlasoWizard:
                 f"Ausgabeordner kann nicht erstellt werden:\n{e}")
             return False
 
-        # 5. Konflikt-Check
         return self._preflight_check_overwrite()
 
     def _preflight_check_overwrite(self):
-        """
-        Prüft ALLE Zieldateien.
-        Im .plaso-Modus wird NUR gegen die Export-Dateien geprüft –
-        die vorhandene .plaso-Datei ist nie Ziel und wird nie gelöscht.
-        """
         mode = self.state["input_mode"]
+        name_export = self.state.get("name_export") or "timeline_export"
         targets = []
 
         if mode == "batch":
@@ -2587,13 +2795,18 @@ class PlasoWizard:
 
         existing = []
         for base, out_dir in targets:
-            # .plaso-Zieldatei NUR prüfen, wenn kein .plaso-Modus
             if mode != "plaso":
                 plaso_target = out_dir / f"{base}.plaso"
                 if plaso_target.exists():
                     existing.append(plaso_target)
+
+            if mode == "batch":
+                export_base = base + "_export"
+            else:
+                export_base = name_export
+
             for _, ext in self.state["selected_formats"]:
-                t = out_dir / f"{base}{ext}"
+                t = out_dir / f"{export_base}{ext}"
                 if t.exists():
                     existing.append(t)
 
@@ -2641,7 +2854,6 @@ class PlasoWizard:
             self.log_queue.put(f"\n✘ Ausnahme: {type(e).__name__}: {e}\n")
             self.log_queue.put(("DONE", 1))
 
-    # ─────────────────────────────────────────────────────────
     def _run_single(self):
         is_folder = (self.state["input_mode"] == "folder")
 
@@ -2654,8 +2866,8 @@ class PlasoWizard:
 
         out_dir = self.state["out_dir"]
         name = self.state["name"]
+        name_export = self.state["name_export"] or "timeline_export"
 
-        # 1. log2timeline
         cmd = self.builder.build_log2timeline(
             mount_source=mount_source,
             input_arg=input_arg,
@@ -2674,7 +2886,6 @@ class PlasoWizard:
             self.log_queue.put(("DONE", rc))
             return
 
-        # 2. pinfo
         plaso_file = Path(out_dir) / f"{name}.plaso"
         if plaso_file.exists():
             self.log_queue.put("\n[2/3] pinfo (optional, Info-Ausgabe)\n")
@@ -2682,17 +2893,12 @@ class PlasoWizard:
             pinfo_rc = self.runner.run_cmd(pinfo_cmd)
             if pinfo_rc != 0:
                 self.log_queue.put(
-                    "\n⚠  pinfo ist mit Fehler beendet (rc="
-                    f"{pinfo_rc}).\n"
-                    "   Das ist ein bekanntes Plaso-Problem (Warning-Counter-"
-                    "Ausgabe).\n"
-                    "   Die eigentliche Verarbeitung ist davon NICHT "
-                    "betroffen.\n")
+                    f"\n⚠  pinfo rc={pinfo_rc} (bekanntes Plaso-Problem, "
+                    f"nicht kritisch)\n")
         else:
             self.log_queue.put(
                 "⚠  .plaso-Datei nicht gefunden – pinfo wird übersprungen.\n")
 
-        # 3. psort pro Format
         filter_expr = self._get_combined_filter_expression()
 
         if filter_expr:
@@ -2703,7 +2909,7 @@ class PlasoWizard:
 
         last_rc = 0
         for fmt, ext in self.state["selected_formats"]:
-            out_name = name + ext
+            out_name = name_export + ext
             self.log_queue.put(f"\n[3/3] psort → {out_name}\n")
             psort_cmd = self.builder.build_psort(
                 out_dir=out_dir,
@@ -2717,12 +2923,10 @@ class PlasoWizard:
                 last_rc = rc
         self.log_queue.put(("DONE", last_rc))
 
-    # ─────────────────────────────────────────────────────────
     def _run_reuse_existing(self):
-        """Wiederverwendung: nur pinfo + psort, kein log2timeline."""
         plaso_path = Path(self.state["existing_plaso_path"])
         out_dir = self.state["out_dir"]
-        name = self.state["name"]
+        name_export = self.state["name_export"] or "timeline_export"
 
         self.log_queue.put(
             "\n" + "═" * 70 + "\n"
@@ -2741,7 +2945,6 @@ class PlasoWizard:
         except OSError as e:
             self.log_queue.put(f"⚠  Hash-Berechnung fehlgeschlagen: {e}\n")
 
-        # 1. pinfo
         self.log_queue.put("\n[1/2] pinfo (optional)\n")
         pinfo_cmd = self.builder.build_pinfo_on_file(str(plaso_path))
         pinfo_rc = self.runner.run_cmd(pinfo_cmd)
@@ -2750,7 +2953,6 @@ class PlasoWizard:
                 f"⚠  pinfo rc={pinfo_rc} (bekanntes Plaso-Problem, "
                 f"nicht kritisch)\n")
 
-        # 2. psort pro Format
         filter_expr = self._get_combined_filter_expression()
         if filter_expr:
             self.log_queue.put(
@@ -2760,7 +2962,7 @@ class PlasoWizard:
 
         last_rc = 0
         for fmt, ext in self.state["selected_formats"]:
-            out_name = name + ext
+            out_name = name_export + ext
             self.log_queue.put(f"\n[2/2] psort → {out_name}\n")
             psort_cmd = self.builder.build_psort_from_existing(
                 plaso_path=str(plaso_path),
@@ -2780,7 +2982,6 @@ class PlasoWizard:
 
         self.log_queue.put(("DONE", last_rc))
 
-    # ─────────────────────────────────────────────────────────
     def _run_batch(self):
         items = self.state["batch_items"]
         total = len(items)
@@ -2818,7 +3019,6 @@ class PlasoWizard:
                 mount_source = str(p.parent)
                 input_arg = f"/mnt/input/{p.name}"
 
-            # 1. log2timeline
             cmd = self.builder.build_log2timeline(
                 mount_source=mount_source,
                 input_arg=input_arg,
@@ -2832,13 +3032,13 @@ class PlasoWizard:
             )
             rc = self.runner.run_cmd(cmd)
             if rc != 0:
-                self.batch_results.append((p.name, False, f"log2timeline rc={rc}"))
+                self.batch_results.append((p.name, False,
+                                           f"log2timeline rc={rc}"))
                 last_rc = rc
                 self.log_queue.put(
                     f"\n✘ Fehler bei {p.name} (rc={rc}), weiter...\n")
                 continue
 
-            # 2. pinfo
             plaso_file = Path(item_out_dir) / f"{uniq}.plaso"
             if plaso_file.exists():
                 self.log_queue.put("\n── pinfo (optional) ──\n")
@@ -2849,11 +3049,11 @@ class PlasoWizard:
                         f"⚠  pinfo rc={pinfo_rc} (bekanntes Plaso-Problem, "
                         f"nicht kritisch)\n")
 
-            # 3. psort pro Format
             filter_expr = self._get_combined_filter_expression()
             item_rc = 0
             for fmt, ext in self.state["selected_formats"]:
-                out_name = uniq + ext
+                out_name = uniq + "_export" + ext
+                self.log_queue.put(f"\n── psort → {out_name} ──\n")
                 psort_cmd = self.builder.build_psort(
                     out_dir=item_out_dir,
                     storage_name=uniq,
@@ -2868,7 +3068,8 @@ class PlasoWizard:
             if item_rc == 0:
                 self.batch_results.append((p.name, True, ""))
             else:
-                self.batch_results.append((p.name, False, f"psort rc={item_rc}"))
+                self.batch_results.append((p.name, False,
+                                           f"psort rc={item_rc}"))
                 last_rc = item_rc
 
         success = sum(1 for _, ok, _ in self.batch_results if ok)
@@ -2889,9 +3090,9 @@ class PlasoWizard:
 
         self.log_queue.put(("DONE", last_rc))
 
-    # ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
     #  Aufräumen
-    # ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
 
     def _on_close(self):
         if self.runner.process and self.runner.process.poll() is None:
@@ -2917,13 +3118,4 @@ if __name__ == "__main__":
         pass
 
     app = PlasoWizard(root)
-
-    if ":" not in PLASO_DOCKER_IMAGE and "@sha256:" not in PLASO_DOCKER_IMAGE:
-        app.log_queue.put(
-            "⚠  HINWEIS: Docker-Image ist nicht auf eine feste Version "
-            "gepinnt.\n"
-            f"   Aktuell: {PLASO_DOCKER_IMAGE}\n"
-            "   Für reproduzierbare forensische Analysen sollte ein "
-            "konkreter Tag oder SHA256-Digest gesetzt werden.\n\n")
-
     root.mainloop()
